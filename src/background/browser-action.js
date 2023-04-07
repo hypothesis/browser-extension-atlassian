@@ -33,6 +33,12 @@ const badgeThemes = {
     defaultText: 'QA',
     color: '#EDA061', // Porche orange-pink
   },
+  production: {
+    defaultText: 'ATL',
+
+    // "Pacific bridge" color from https://atlassian.design/foundations/color
+    color: '#0052CC',
+  },
 };
 
 /**
