@@ -22,7 +22,23 @@ function setClientConfig(config) {
   script.className = 'js-hypothesis-config';
   script.type = 'application/json';
   script.textContent = JSON.stringify(config);
+  // This ensures the client removes the script when the extension is deactivated
+  script.setAttribute('data-remove-on-unload', '');
   document.head.appendChild(script);
+}
+
+/**
+ * Function that is run in a frame to test whether the Hypothesis client is
+ * active there.
+ *
+ * @param {string} extensionURL - Root URL for the extension, of the form
+ *   "chrome-extension://{ID}/".
+ */
+function isClientActive(extensionURL) {
+  const annotatorLink = /** @type {HTMLLinkElement|null} */ (
+    document.querySelector('link[type="application/annotator+html"]')
+  );
+  return annotatorLink?.href.startsWith(extensionURL) ?? false;
 }
 
 /**
@@ -58,7 +74,54 @@ export function SidebarInjector() {
   const pdfViewerBaseURL = chromeAPI.runtime.getURL('/pdfjs/web/viewer.html');
 
   /**
+   * Check for the presence of the client in a browser tab.
+   *
+   * If code cannot be run in this tab to check the state of the client, it is
+   * assumed to not be active.
+   *
+   * @param {chrome.tabs.Tab} tab
+   * @return {Promise<boolean>}
+   */
+  this.isClientActiveInTab = async tab => {
+    const tab_ = checkTab(tab);
+
+    // If this is our PDF viewer, the client is definitely active.
+    if (isPDFViewerURL(tab_.url)) {
+      return true;
+    }
+
+    // In the VitalSource book reader, we need to test a specific frame.
+    let frameId;
+    if (isVitalSourceURL(tab_.url)) {
+      const vsFrame = await getVitalSourceViewerFrame(tab_);
+      if (vsFrame) {
+        frameId = vsFrame.frameId;
+      }
+    }
+
+    try {
+      const extensionURL = chromeAPI.runtime.getURL('/');
+      const isActive = await executeFunction({
+        tabId: tab_.id,
+        frameId,
+        func: isClientActive,
+        args: [extensionURL],
+      });
+      return isActive;
+    } catch {
+      // We failed to run code in this tab, eg. because it is a URL that
+      // disallows extension scripting or it is being unloaded.
+      return false;
+    }
+  };
+
+  /**
    * Injects the Hypothesis sidebar into the tab provided.
+   *
+   * Certain URLs (eg. VitalSource books) may require extra permissions to
+   * inject. These must be obtained by calling {@link requestExtraPermissionsForTab},
+   * directly after the user clicks the extension's toolbar icon, before calling
+   * this method.
    *
    * @param {chrome.tabs.Tab} tab - A tab object representing the tab to insert the sidebar
    *        into.
@@ -93,6 +156,29 @@ export function SidebarInjector() {
       return removeFromVitalSource(tab_);
     } else {
       return removeFromHTML(tab_);
+    }
+  };
+
+  /**
+   * Request additional permissions that are required to inject Hypothesis
+   * into a given tab.
+   *
+   * Ideally the permissions request would just be part of {@link injectIntoTab}
+   * however it needs to be performed immediately after the user clicks the
+   * extension's toolbar icon, before any async calls, otherwise it will fail
+   * due to lack of a user gesture. See https://bugs.chromium.org/p/chromium/issues/detail?id=1363490.
+   *
+   * @param {chrome.tabs.Tab} tab
+   */
+  this.requestExtraPermissionsForTab = async tab => {
+    const tab_ = checkTab(tab);
+    if (isVitalSourceURL(tab_.url)) {
+      return await chromeAPI.permissions.request({
+        permissions: ['webNavigation'],
+      });
+    } else {
+      // No extra permissions needed for other tabs.
+      return true;
     }
   };
 
@@ -260,10 +346,8 @@ export function SidebarInjector() {
         "Hypothesis extension can't be used on Hypothesis LMS assignments"
       );
     } else {
-      await injectConfig(tab.id, config);
-
       const result = /** @type {{ installedURL: string }|null} */ (
-        await injectIntoHTML(tab)
+        await injectIntoHTML(tab, config)
       );
       if (
         typeof result?.installedURL === 'string' &&
@@ -294,12 +378,13 @@ export function SidebarInjector() {
     }
   }
 
-  /** @param {Tab} tab */
-  function injectIntoHTML(tab) {
-    return executeScript({
-      tabId: tab.id,
-      file: '/client/build/boot.js',
-    });
+  /**
+   * @param {Tab} tab
+   * @param {object} config
+   */
+  async function injectIntoHTML(tab, config) {
+    await injectConfig(tab.id, config);
+    return executeClientBootScript(tab.id);
   }
 
   /** @param {Tab} tab */
@@ -345,6 +430,7 @@ export function SidebarInjector() {
    *     |- jigsaw.vitalsource.com (Content of current chapter)
    *
    * @param {Tab} tab
+   * @return {Promise<chrome.webNavigation.GetAllFrameResultDetails|undefined>}
    */
   async function getVitalSourceViewerFrame(tab) {
     // Using `chrome.webNavigation.getAllFrames` requires asking for the
@@ -352,20 +438,15 @@ export function SidebarInjector() {
     // browser history, even though we only want to get frames for the current
     // tab :(
     //
-    // We check for the permission using `getAll` first, because `request` will
-    // trigger an error if called outside of a user gesture, even if we do have
-    // the permission. When the user initially activates the client in VS, this
-    // function will be called within a user gesture. Subsequent automatic
-    // activations (eg. after navigation) may happen outside of a user gesture
-    // however.
-    let canUseWebNavigation = (
+    // The request for permissions must happen immediately after clicking
+    // the browser action, to avoid an error about it happening outside a user
+    // gesture [1]. This is done by calling `requestExtraPermissionsForTab`
+    // before `injectIntoTab`.
+    //
+    // [1] https://bugs.chromium.org/p/chromium/issues/detail?id=1363490
+    const canUseWebNavigation = (
       await chromeAPI.permissions.getAll()
     ).permissions?.includes('webNavigation');
-    if (!canUseWebNavigation) {
-      canUseWebNavigation = await chromeAPI.permissions.request({
-        permissions: ['webNavigation'],
-      });
-    }
     if (!canUseWebNavigation) {
       throw new Error('The extension was not granted required permissions');
     }
@@ -400,11 +481,7 @@ export function SidebarInjector() {
       throw new Error('Book viewer frame not found');
     }
     await injectConfig(tab.id, config, frame.frameId);
-    await executeScript({
-      tabId: tab.id,
-      frameId: frame.frameId,
-      file: '/client/build/boot.js',
-    });
+    await executeClientBootScript(tab.id, frame.frameId);
   }
 
   /** @param {Tab} tab */
@@ -434,6 +511,18 @@ export function SidebarInjector() {
       frameId,
       func: setClientConfig,
       args: [clientConfig],
+    });
+  }
+
+  /**
+   * @param {number} tabId
+   * @param {number} [frameId]
+   */
+  async function executeClientBootScript(tabId, frameId) {
+    return executeScript({
+      tabId,
+      frameId,
+      file: '/client/build/boot.js',
     });
   }
 }
