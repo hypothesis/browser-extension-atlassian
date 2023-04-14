@@ -1,7 +1,7 @@
 {
   "buildType": "production",
   "manifestV3": true,
-  "key": "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCq7XsXE/uakq4aKMG5Smz2nc8VSaandriziGorxX08py3mTkab79GpWYu7j/hA3Yf7fkCLQnX8QoZGj7WdaMX6+b+eHxF7vYpOhEW/Bam7TOlb+5AVmL1KReG9PPTLz4dp+xA4WfK2dqFM+XN40FTbm2G/SNk3GRP3gQOxgy3ZKwIDAQAB",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAyT0dNT9cFWMAoxups6goA/F+FtFl9pt2GkUSLqa978JoeXad0pIMZhYiTEdbXK9wS3MAdQHsq5wTJMmuUSUknVfFG61JXk1aGIu1cenhFVhbi/8FGEp/9yCuPgkBeokEWZkBvIFrL+jyrMt8G4WgfVHfvKLfv6AaPjZmLFqkLxQcI47WyHlqi35v19r7/w1s22quPIlw2iXkBPuU7Nob1RzUZd3N9HingQ/yX+D6HuOJmyDhoJlhST6b7Iu9YuRgeW2+q36c+nYO5lbXVMit4OATabfcYg0bMPBs4c93NtkeS0+UECjVuZx0v+4gSFz4Gv2hObSDQ129u1AkpZ4CJQIDAQAB",
 
   "apiUrl": "https://hypothesis-confluence-beta.herokuapp.com/api/",
   "authDomain": "hypothes.is",
