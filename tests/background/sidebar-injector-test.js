@@ -119,6 +119,10 @@ describe('SidebarInjector', function () {
 
       runtime: {
         getURL: sinon.spy(path => EXTENSION_BASE_URL + path),
+        onMessage: {
+          addListener: sinon.stub(),
+          removeListener: sinon.stub(),
+        },
       },
 
       permissions: {
@@ -157,6 +161,7 @@ describe('SidebarInjector', function () {
         chromeAPI: fakeChromeAPI,
         executeFunction: fakeExecuteFunction,
         executeScript: fakeExecuteScript,
+        getExtensionId: () => 'hypothesisId',
       },
     });
 
@@ -262,27 +267,51 @@ describe('SidebarInjector', function () {
     describe('when viewing a remote PDF', function () {
       const url = 'http://example.com/foo.pdf';
 
-      it('injects hypothesis into the page', function () {
+      beforeEach(() => {
         contentType = 'PDF';
+      });
+
+      it('navigates page to Hypothesis PDF viewer', async () => {
         const spy = fakeChromeAPI.tabs.update.resolves({ tab: 1 });
-        return injector.injectIntoTab({ id: 1, url: url }).then(function () {
-          assert.calledWith(spy, 1, {
-            url: PDF_VIEWER_BASE_URL + encodeURIComponent(url),
-          });
+
+        await injector.injectIntoTab({ id: 1, url: url });
+
+        assert.calledWith(spy, 1, {
+          url: PDF_VIEWER_BASE_URL + encodeURIComponent(url),
         });
       });
 
-      it('preserves #annotations fragments in the URL', function () {
-        contentType = 'PDF';
+      it('responds to Hypothesis client config request', async () => {
+        const clientConfig = {
+          assetRoot: 'chrome-extension://abc/',
+          annotations: 'abc123',
+        };
+
+        await injector.injectIntoTab({ id: 1, url: url }, clientConfig);
+
+        const onMessage = fakeChromeAPI.runtime.onMessage;
+        assert.calledOnce(onMessage.addListener);
+
+        // Simulate request for client config from `pdfjs-init.js`.
+        const onMessageCallback = onMessage.addListener.args[0][0];
+        const sender = { tab: { id: 1 } };
+        const sendResponse = sinon.stub();
+        onMessageCallback({ type: 'getConfigForTab' }, sender, sendResponse);
+
+        // Verify config was sent to tab and listener was removed.
+        assert.calledWith(sendResponse, clientConfig);
+        assert.calledWith(onMessage.removeListener, onMessageCallback);
+      });
+
+      it('preserves fragments in the URL', async () => {
         const spy = fakeChromeAPI.tabs.update.resolves({ tab: 1 });
-        const hash = '#annotations:456';
-        return injector
-          .injectIntoTab({ id: 1, url: url + hash })
-          .then(function () {
-            assert.calledWith(spy, 1, {
-              url: PDF_VIEWER_BASE_URL + encodeURIComponent(url) + hash,
-            });
-          });
+        const hash = '#foobar';
+
+        await injector.injectIntoTab({ id: 1, url: url + hash });
+
+        assert.calledWith(spy, 1, {
+          url: PDF_VIEWER_BASE_URL + encodeURIComponent(url) + hash,
+        });
       });
     });
 
@@ -351,6 +380,7 @@ describe('SidebarInjector', function () {
             tabId: 1,
             frameId: vitalSourceFrames.reader.frameId,
             func: { name: 'setClientConfig' },
+            args: [sinon.match.any, 'hypothesisId'],
           })
         );
 

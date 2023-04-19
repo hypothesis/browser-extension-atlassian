@@ -6,6 +6,44 @@ import { HelpPage } from './help-page';
 import settings from './settings';
 import { SidebarInjector } from './sidebar-injector';
 import { TabState } from './tab-state';
+import type { State } from './tab-state';
+
+/** Options for {@link Extension.activate}. */
+export type ActivateOptions = {
+  /**
+   * Defer activation of the extension until the tab navigates to this URL. This
+   * is useful when the extension wants to handle a bouncer link by first
+   * navigating the tab and then activating the extension.
+   */
+  afterNavigationTo?: string;
+  /** Direct link query (eg. `#annotations:{id}`) to configure client to follow. */
+  query?: string;
+};
+
+/**
+ * Normalize a URL for comparison. This strips the fragment and converts
+ * `http://` to `https://`.
+ */
+function normalizeURL(url: string) {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+    if (parsed.protocol === 'http:') {
+      parsed.protocol = 'https:';
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Return true if two URLs are equal, ignoring the fragment and treating HTTP
+ * and HTTPS as equivalent.
+ */
+function urlsEqual(urlA: string, urlB: string) {
+  return normalizeURL(urlA) === normalizeURL(urlB);
+}
 
 /**
  * The main extension background application.
@@ -21,21 +59,34 @@ import { TabState } from './tab-state';
  *     extension state for existing tabs.
  */
 export class Extension {
+  firstRun: (extensionInfo: chrome.management.ExtensionInfo) => Promise<void>;
+  activate: (tabId: number, options: ActivateOptions) => void;
+  init: () => Promise<void>;
+
+  private _onTabStateChange: (
+    tabId: number,
+    current: State | undefined
+  ) => Promise<void>;
+
   constructor() {
     const help = new HelpPage();
     const state = new TabState(onTabStateChange);
     const browserAction = new BrowserAction();
     const sidebar = new SidebarInjector();
 
-    /** @type {Map<number, string>} */
-    const currentlyLoadingUrl = new Map(); // keeps tracks of what URL each tab is loading
+    const currentlyLoadingUrl = new Map<number, string>(); // keeps tracks of what URL each tab is loading
+
+    /**
+     * Pending activations of extension. This is a map of tab ID to activation
+     * URL and options. The activation is applied when the tab navigates to
+     * the given URL.
+     */
+    const pendingActivations = new Map<number, ActivateOptions>();
 
     /**
      * Opens the onboarding page.
-     *
-     * @param {chrome.management.ExtensionInfo} extensionInfo
      */
-    this.firstRun = async extensionInfo => {
+    this.firstRun = async (extensionInfo: chrome.management.ExtensionInfo) => {
       // If we've been installed because of an administrative policy, then don't
       // open the welcome page in a new tab.
       //
@@ -54,7 +105,21 @@ export class Extension {
       const tab = await chromeAPI.tabs.create({
         url: settings.serviceUrl + 'welcome',
       });
-      state.activateTab(/** @type {number} */ (tab.id));
+      state.activateTab(tab.id!);
+    };
+
+    /**
+     * Activate the extension on a specific tab.
+     */
+    this.activate = (tabId: number, options: ActivateOptions = {}) => {
+      if (options.afterNavigationTo) {
+        pendingActivations.set(tabId, options);
+      } else {
+        state.setState(tabId, {
+          state: 'active',
+          directLinkQuery: directLinkQuery(options.query ?? '') ?? undefined,
+        });
+      }
     };
 
     /**
@@ -103,44 +168,7 @@ export class Extension {
       }
     };
 
-    /**
-     * Initialize the extension.
-     *
-     * This queries the state of the extension in existing tabs and sets up
-     * event listeners to respond to future tab changes.
-     *
-     * If the extension's state in a particular tab cannot be determined,
-     * the extension is assumed not to be loaded in that tab.
-     *
-     * @return - A promise that resolves once listeners have been set up and
-     *   the state of existing tabs has been determined.
-     */
-    this.init = async () => {
-      chromeAPI.browserAction.onClicked.addListener(onBrowserActionClicked);
-
-      // Set up listeners for tab events.
-      chromeAPI.tabs.onCreated.addListener(onTabCreated);
-
-      // When a user navigates within an existing tab, onUpdated is fired in most cases
-      chromeAPI.tabs.onUpdated.addListener(onTabUpdated);
-
-      // ... but when a user navigates to a page that is loaded
-      // via prerendering or instant results, onTabReplaced is
-      // fired instead. See https://developer.chrome.com/extensions/tabs#event-onReplaced
-      // and https://code.google.com/p/chromium/issues/detail?id=109557
-      chromeAPI.tabs.onReplaced.addListener(onTabReplaced);
-
-      chromeAPI.tabs.onRemoved.addListener(onTabRemoved);
-
-      // Determine the state of the extension in existing tabs.
-      await initTabStates();
-    };
-
-    /**
-     * @param {number} tabId
-     * @param {import('./tab-state').State | undefined} current
-     */
-    async function onTabStateChange(tabId, current) {
+    async function onTabStateChange(tabId: number, current: State | undefined) {
       if (!current) {
         return;
       }
@@ -161,9 +189,8 @@ export class Extension {
     // exposed for use by tests
     this._onTabStateChange = onTabStateChange;
 
-    /** @param {chrome.tabs.Tab} tab */
-    async function onBrowserActionClicked(tab) {
-      const tabId = /** @type {number} */ (tab.id);
+    async function onBrowserActionClicked(tab: chrome.tabs.Tab) {
+      const tabId = tab.id!;
       const tabError = state.getState(tabId).error;
       if (tabError) {
         help.showHelpForError(tab, tabError);
@@ -189,12 +216,9 @@ export class Extension {
     }
 
     /**
-     * Returns the active state for a tab
-     * which has just been navigated to.
-     *
-     * @param {number} tabId
+     * Returns the active state for a tab which has just been navigated to.
      */
-    function activeStateForNavigatedTab(tabId) {
+    function activeStateForNavigatedTab(tabId: number) {
       let activeState = state.getState(tabId).state;
       if (activeState === 'errored') {
         // user had tried to activate H on the previous page but it failed,
@@ -204,11 +228,7 @@ export class Extension {
       return activeState;
     }
 
-    /**
-     * @param {number} tabId
-     * @param {string} url
-     */
-    function resetTabState(tabId, url) {
+    function resetTabState(tabId: number, url: string) {
       state.setState(tabId, {
         state: activeStateForNavigatedTab(tabId),
         ready: false,
@@ -226,14 +246,14 @@ export class Extension {
      * Two important events are when the tab's `status` changes to `loading`
      * when the user begins a new navigation and when the tab's status changes
      * to `complete` after the user completes a navigation
-     *
-     * @param {number} tabId
-     * @param {chrome.tabs.TabChangeInfo} changeInfo
-     * @param {chrome.tabs.Tab} tab
      */
-    function onTabUpdated(tabId, { status }, tab) {
+    const onTabUpdated = (
+      tabId: number,
+      { status }: chrome.tabs.TabChangeInfo,
+      tab: chrome.tabs.Tab
+    ) => {
       // `url` property is included because manifest has the `tabs` permission
-      const url = /** @type {string} */ (tab.url);
+      const url = tab.url!;
       const loadingUrl = currentlyLoadingUrl.get(tabId);
       if (status === 'loading' && url !== loadingUrl) {
         currentlyLoadingUrl.set(tabId, url);
@@ -254,13 +274,27 @@ export class Extension {
           state: newActiveState,
         });
       }
-    }
 
-    /**
-     * @param {number} addedTabId
-     * @param {number} removedTabId
-     */
-    async function onTabReplaced(addedTabId, removedTabId) {
+      // Apply activations scheduled for when tab navigates to its current URL.
+      //
+      // We compare normalized URLs because the browser may modify the fragment
+      // or redirect HTTP to HTTPS, compared to the URL we expected the tab
+      // to navigate to.
+      const pendingActivation = pendingActivations.get(tabId);
+      if (
+        pendingActivation?.afterNavigationTo &&
+        urlsEqual(pendingActivation.afterNavigationTo, url)
+      ) {
+        pendingActivations.delete(tabId);
+
+        // Clear the URL so that the activation takes effect immediately.
+        pendingActivation.afterNavigationTo = undefined;
+
+        this.activate(tabId, pendingActivation);
+      }
+    };
+
+    async function onTabReplaced(addedTabId: number, removedTabId: number) {
       state.setState(addedTabId, {
         state: activeStateForNavigatedTab(removedTabId),
         ready: true,
@@ -268,25 +302,17 @@ export class Extension {
       state.clearTab(removedTabId);
 
       const tab = await chromeAPI.tabs.get(addedTabId);
-      updateAnnotationCountIfEnabled(
-        addedTabId,
-        /** @type {string} */ (tab.url)
-      );
+      updateAnnotationCountIfEnabled(addedTabId, tab.url!);
     }
 
-    /** @param {chrome.tabs.Tab} tab */
-    function onTabCreated(tab) {
+    function onTabCreated(tab: chrome.tabs.Tab) {
       // Clear the state in case there is old, conflicting data in storage.
       if (tab.id) {
         onTabRemoved(tab.id);
       }
     }
 
-    /**
-     *
-     * @param {number} tabId
-     */
-    function onTabRemoved(tabId) {
+    function onTabRemoved(tabId: number) {
       currentlyLoadingUrl.delete(tabId);
       state.clearTab(tabId);
     }
@@ -294,11 +320,9 @@ export class Extension {
     /**
      * Installs or uninstalls the sidebar from a tab when the H
      * state for a tab changes
-     *
-     * @param {chrome.tabs.Tab} tab
      */
-    function updateTabDocument(tab) {
-      const tabId = /** @type {number} */ (tab.id);
+    function updateTabDocument(tab: chrome.tabs.Tab) {
+      const tabId = tab.id!;
 
       // If the tab has not yet finished loading then just quietly return.
       if (!state.getState(tabId).ready) {
@@ -363,11 +387,7 @@ export class Extension {
       }
     }
 
-    /**
-     * @param {number} tabId
-     * @param {string} url
-     */
-    async function updateAnnotationCountIfEnabled(tabId, url) {
+    async function updateAnnotationCountIfEnabled(tabId: number, url: string) {
       // If user disabled the badge count, this call to `sync.get` will
       // return `{ badge: false}`
       const { badge } = await chromeAPI.storage.sync.get({
@@ -377,5 +397,38 @@ export class Extension {
         state.updateAnnotationCount(tabId, url);
       }
     }
+
+    /**
+     * Initialize the extension.
+     *
+     * This queries the state of the extension in existing tabs and sets up
+     * event listeners to respond to future tab changes.
+     *
+     * If the extension's state in a particular tab cannot be determined,
+     * the extension is assumed not to be loaded in that tab.
+     *
+     * @return - A promise that resolves once listeners have been set up and
+     *   the state of existing tabs has been determined.
+     */
+    this.init = async () => {
+      chromeAPI.browserAction.onClicked.addListener(onBrowserActionClicked);
+
+      // Set up listeners for tab events.
+      chromeAPI.tabs.onCreated.addListener(onTabCreated);
+
+      // When a user navigates within an existing tab, onUpdated is fired in most cases
+      chromeAPI.tabs.onUpdated.addListener(onTabUpdated);
+
+      // ... but when a user navigates to a page that is loaded
+      // via prerendering or instant results, onTabReplaced is
+      // fired instead. See https://developer.chrome.com/extensions/tabs#event-onReplaced
+      // and https://code.google.com/p/chromium/issues/detail?id=109557
+      chromeAPI.tabs.onReplaced.addListener(onTabReplaced);
+
+      chromeAPI.tabs.onRemoved.addListener(onTabRemoved);
+
+      // Determine the state of the extension in existing tabs.
+      await initTabStates();
+    };
   }
 }
