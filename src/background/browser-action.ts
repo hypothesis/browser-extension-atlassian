@@ -30,10 +30,10 @@ const badgeThemes: Record<string, { defaultText: string; color: string }> = {
     color: '#EDA061', // Porche orange-pink
   },
   production: {
-    defaultText: 'ATL',
+    defaultText: 'SLK',
 
-    // "Pacific bridge" color from https://atlassian.design/foundations/color
-    color: '#0052CC',
+    // "4A154B" color from https://brand.slackhq.com/color
+    color: '#4A154B',
   },
 };
 
